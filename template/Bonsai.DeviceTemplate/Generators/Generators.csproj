@@ -36,6 +36,11 @@
           ConsoleToMSBuild="true"
           Condition="Exists($(DeviceMetadata)) And $([System.String]::new('%(TextTemplates.Identity)').EndsWith('harpdevice.tt'))"
           Command="t4 %(TextTemplates.Identity) $(PythonInterfaceFlags) -o=$(PythonInterfacePath)/harp/devices/$pythonmodulenameshort$/%(TextTemplates.Filename) -v" />
+    
+    <Exec WorkingDirectory="$(ProjectDir)"
+          ConsoleToMSBuild="true"
+          Condition="Exists($(DeviceMetadata)) And $([System.String]::new('%(TextTemplates.Identity)').EndsWith('base.tt'))"
+          Command="t4 %(TextTemplates.Identity) $(PythonInterfaceFlags) -o=$(PythonInterfacePath)/harp/devices/$pythonmodulenameshort$/%(TextTemplates.Filename) -v" />
 
     <Exec WorkingDirectory="$(ProjectDir)"
           ConsoleToMSBuild="true"
