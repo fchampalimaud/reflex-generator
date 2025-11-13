@@ -1,0 +1,717 @@
+<#@ template debug="false" hostspecific="true" language="C#" #>
+<#@ parameter name="Namespace" type="string" #>
+<#@ parameter name="MetadataPath" type="string" #>
+<#@ assembly name="System.Core" #>
+<#@ import namespace="System.IO" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ import namespace="System.Globalization" #>
+<#@ import namespace="System.Text.RegularExpressions" #>
+<#@ include file="Interface.tt" #><##>
+<#@ output extension=".py" #>
+<#
+var deviceMetadata = TemplateHelper.ReadDeviceMetadata(MetadataPath);
+var publicRegisters = deviceMetadata.Registers.Where(register => register.Value.Visibility == RegisterVisibility.Public).ToList();
+var deviceRegisters = deviceMetadata.Registers;
+var deviceName = deviceMetadata.Device;
+var bitmaskTypes = new HashSet<string>(deviceMetadata.BitMasks.Keys);
+var groupmaskTypes = new HashSet<string>(deviceMetadata.GroupMasks.Keys);
+#>
+from __future__ import annotations
+
+import logging
+import queue
+from dataclasses import dataclass
+from enum import Enum, IntEnum, IntFlag
+from io import BufferedWriter
+from pathlib import Path
+from typing import Literal, Optional
+
+import serial
+from harp.protocol import (
+    CommonRegisters,
+    MessageType,
+    OperationCtrl,
+    PayloadType,
+)
+from harp.protocol.exceptions import HarpTimeoutException
+from harp.protocol.messages import HarpMessage
+from harp.serial.harp_serial import HarpSerial
+
+
+class TimeoutStrategy(Enum):
+    """
+    Strategy to handle timeouts when waiting for a reply from the device.
+
+    Attributes
+    ----------
+    RAISE : str
+        Raise HarpTimeoutException
+    RETURN_NONE : str
+        Return None
+    LOG_AND_RAISE : str
+        Log the timeout and raise HarpTimeoutException
+    LOG_AND_NONE : str
+        Log the timeout and return None
+    """
+
+    RAISE = "raise"  # Raise HarpTimeoutException
+    RETURN_NONE = "return_none"  # Return None
+    LOG_AND_RAISE = "log_and_raise"
+    LOG_AND_NONE = "log_and_none"
+
+<#
+// Order is important for acronyms, so longer acronyms should be listed first
+string[] AcronymExceptions = new[] { "DIO", "DI", "DO", "IR", "USB" };
+// Regex for units: ms, hz, v (case-insensitive)
+Regex UnitRegex = new Regex(@"^\d+(ms|hz|v)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+string ToSnakeCase(string name, bool allCaps = false)
+{
+    if (string.IsNullOrEmpty(name)) return name;
+    var sb = new System.Text.StringBuilder();
+    int i = 0;
+    while (i < name.Length)
+    {
+        bool matched = false;
+        // Acronym exceptions
+        foreach (var acronym in AcronymExceptions)
+        {
+            if (i + acronym.Length <= name.Length &&
+                string.Compare(name, i, acronym, 0, acronym.Length, ignoreCase: false, culture: null) == 0)
+            {
+                if (i > 0 && sb[sb.Length - 1] != '_')
+                    sb.Append('_');
+                sb.Append(acronym.ToLowerInvariant());
+                i += acronym.Length;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        // Digits+unit pattern (e.g., 5V, 10300Hz, 1Ms)
+        var unitMatch = UnitRegex.Match(name.Substring(i));
+        if (unitMatch.Success)
+        {
+            int matchLen = unitMatch.Length;
+            int nextIdx = i + matchLen;
+            // Only treat as a unit if next char does not exist or is uppercase
+            if (nextIdx >= name.Length || char.IsUpper(name[nextIdx]))
+            {
+                if (i > 0 && sb[sb.Length - 1] != '_')
+                    sb.Append('_');
+                sb.Append(name.Substring(i, matchLen).ToLowerInvariant());
+                i += matchLen;
+                // If next char is uppercase, treat as word boundary
+                if (nextIdx < name.Length && char.IsUpper(name[nextIdx]))
+                    sb.Append('_');
+                continue;
+            }
+        }
+
+        // Digits: keep with previous word, and if next char is uppercase, treat as word boundary
+        if (char.IsDigit(name[i]))
+        {
+            sb.Append(name[i]);
+            int nextIdx = i + 1;
+            if (nextIdx < name.Length && char.IsUpper(name[nextIdx]))
+                sb.Append('_');
+            i++;
+            continue;
+        }
+
+        // Default PascalCase to snake_case
+        var c = name[i];
+        if (char.IsUpper(c) && i > 0 && sb[sb.Length - 1] != '_')
+            sb.Append('_');
+        sb.Append(char.ToLowerInvariant(c));
+        i++;
+    }
+    var result = sb.ToString();
+    return allCaps ? result.ToUpperInvariant() : result;
+}
+
+// Helper for type conversion
+Func<string, string> pyType = t =>
+{
+    switch (t)
+    {
+        case "byte":
+        case "sbyte":
+        case "ushort":
+        case "short":
+        case "uint":
+        case "int":
+        case "ulong":
+        case "long":
+            return "int";
+        case "float":
+            return "float";
+        case "ArraySegment<byte>":
+        case "byte[]":
+            return "bytes";
+        case "short[]":
+        case "ushort[]":
+        case "uint[]":
+        case "int[]":
+        case "long[]":
+            return "list[int]";
+        case "EnableFlag":
+            return "bool";
+        default:
+            return t; // fallback
+    }
+};
+
+// Helper for type conversion
+Func<string, string> pyTypeHM = t =>
+{
+    switch (t)
+    {
+        case "byte":
+        case "sbyte":
+        case "ushort":
+        case "short":
+        case "uint":
+        case "int":
+        case "ulong":
+        case "long":
+            return "int";
+        case "float":
+            return "float";
+        case "ArraySegment<byte>":
+        case "byte[]":
+            return "bytes";
+        case "short[]":
+        case "ushort[]":
+        case "uint[]":
+        case "int[]":
+        case "long[]":
+            return "list[int]";
+        case "EnableFlag":
+            return "bool";
+        default:
+            return "int"; // fallback
+    }
+};
+#>
+<# // Payload dataclasses
+var payloadTypes = new HashSet<string>();
+foreach (var registerMetadata in deviceRegisters)
+{
+    var register = registerMetadata.Value;
+    if (register.PayloadSpec == null) continue;
+    var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, register);
+    if (!payloadTypes.Add(interfaceType)) continue;
+#>
+
+
+@dataclass
+class <#= interfaceType #>:
+<# 
+    foreach (var member in register.PayloadSpec)
+    {
+        var memberType = TemplateHelper.GetInterfaceType(member.Value, register.Type);
+        if (!string.IsNullOrEmpty(member.Value.Description))
+        {
+#>
+        # <#= member.Value.Description #>
+<#      }
+#>
+    <#= member.Key #>: <#= pyType(memberType) #>
+<# 
+    }
+}
+#>
+<# // BitMask enums
+foreach (var bitMask in deviceMetadata.BitMasks)
+{
+    var mask = bitMask.Value;
+#>
+
+
+class <#= bitMask.Key #>(IntFlag):
+    """
+    <#= mask.Description #>
+
+    Attributes
+    ----------
+<# 
+    foreach (var bitField in mask.Bits)
+    {
+        var fieldInfo = bitField.Value;
+#>
+    <#= ToSnakeCase(bitField.Key, allCaps:true) #> : int
+        <#= string.IsNullOrEmpty(fieldInfo.Description) ? "_No description currently available_" : fieldInfo.Description #>
+<#  } #>
+    """
+
+<#   
+    // Add a NONE value if there are no bits set
+    var bitCount = mask.Bits.Count;
+    if (!mask.Bits.Values.Any(fieldInfo => fieldInfo.Value == 0))
+    {
+#>
+    NONE = 0x0
+<#
+    }
+    foreach (var bitField in mask.Bits)
+    {
+        var fieldInfo = bitField.Value;
+#>
+    <#= ToSnakeCase(bitField.Key, allCaps:true) #> = 0x<#= fieldInfo.Value.ToString("X") #>
+<#
+    }
+}
+#>
+<# 
+// GroupMask enums
+foreach (var groupMask in deviceMetadata.GroupMasks)
+{
+    var mask = groupMask.Value;
+#>
+
+
+class <#= groupMask.Key #>(IntEnum):
+    """
+    <#= mask.Description #>
+
+    Attributes
+    ----------
+<# 
+    foreach (var member in mask.Values)
+    {
+        var memberInfo = member.Value;
+#>
+    <#= ToSnakeCase(member.Key, allCaps:true) #> : int
+        <#= string.IsNullOrEmpty(memberInfo.Description) ? "_No description currently available_" : memberInfo.Description #>
+<#  } #>
+    """
+
+<# 
+    foreach (var member in mask.Values)
+    {
+        var memberInfo = member.Value;
+#>
+    <#= ToSnakeCase(member.Key, allCaps:true) #> = <#= memberInfo.Value #>
+<#
+    }
+}
+#>
+
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+#>
+
+
+class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
+    ADDRESS: int = <#= address #>
+
+    def __init__(
+        self,
+        payload: Optional[<#= pyType(interfaceType) #>] = None,
+        message_type: MessageType = MessageType.READ,
+        payload_type: Literal[
+            PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>, PayloadType.TIMESTAMPED_<#= reg.Type.ToString().ToUpperInvariant() #>
+        ] = PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>,
+        *,
+        timestamp: Optional[float] = None,
+        port: int = 255,
+    ):
+        super().__init__(
+            message_type, self.ADDRESS, payload_type, payload, timestamp, port
+        )
+<#
+    }
+#>
+
+
+<#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS = {
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+#>
+    <#= address #>: <#= regName #>,
+<#
+    }
+#>
+}
+
+
+class Device:
+    """
+    The `Device` class provides the interface for interacting with Harp devices. This implementation of the Harp device was based on the official documentation available on the [harp-tech website](https://harp-tech.org/protocol/Device.html).
+
+    Attributes
+    ----------
+    WHO_AM_I : int
+        The device ID number. A list of devices can be found [here](https://github.com/harp-tech/protocol/blob/main/whoami.md)
+    HW_VERSION_H : int
+        The major hardware version
+    HW_VERSION_L : int
+        The minor hardware version
+    ASSEMBLY_VERSION : int
+        The version of the assembled components
+    HARP_VERSION_H : int
+        The major Harp core version
+    HARP_VERSION_L : int
+        The minor Harp core version
+    FIRMWARE_VERSION_H : int
+        The major firmware version
+    FIRMWARE_VERSION_L : int
+        The minor firmware version
+    DEVICE_NAME : str
+        The device name stored in the Harp device
+    SERIAL_NUMBER : int, optional
+        The serial number of the device
+    """
+
+    WHO_AM_I: int
+    HW_VERSION_H: int
+    HW_VERSION_L: int
+    ASSEMBLY_VERSION: int
+    CORE_VERSION_H: int
+    CORE_VERSION_L: int
+    FIRMWARE_VERSION_H: int
+    FIRMWARE_VERSION_L: int
+    DEVICE_NAME: str
+    SERIAL_NUMBER: int
+    CLOCK_CONFIG: int
+    TIMESTAMP_OFFSET: int
+
+    COMMON_REGISTERS_TYPE = <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS
+    DEVICE_REGISTERS_TYPE = {}
+
+    _ser: HarpSerial
+    _dump_file_path: Optional[Path]
+    _dump_file: Optional[BufferedWriter] = None
+    _timeout: float
+
+    def __init__(
+        self,
+        serial_port: str,
+        dump_file_path: Optional[str] = None,
+        timeout: float = 1,
+        timeout_strategy: TimeoutStrategy = TimeoutStrategy.RAISE,
+    ):
+        """
+        Parameters
+        ----------
+        serial_port : str
+            The serial port used to establish the connection with the Harp device. It must be denoted as `/dev/ttyUSBx` in Linux and `COMx` in Windows, where `x` is the number of the serial port
+        dump_file_path: str, optional
+            The binary file to which all Harp messages will be written
+        timeout: float, optional
+            The timeout in seconds when waiting for a reply from the device
+        timeout_strategy: TimeoutStrategy, optional
+            The strategy to handle timeouts when waiting for a reply from the device
+        """
+        self.log = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self._serial_port = serial_port
+        self._dump_file_path = None
+        if dump_file_path is not None:
+            self._dump_file_path = Path() / dump_file_path
+        self._timeout = timeout
+        self._timeout_strategy = timeout_strategy
+
+        # Connect to the Harp device and load the data stored in the device's common registers
+        self.connect()
+        self.load()
+
+<# //TODO: generate this automatically #>
+    def load(self) -> None:
+        """
+        Loads the data stored in the device's common registers.
+        """
+        self.WHO_AM_I = self.read_who_am_i()
+        self.HW_VERSION_H = self.read_hardware_version_high()
+        self.HW_VERSION_L = self.read_hardware_version_low()
+        self.ASSEMBLY_VERSION = self.read_assembly_version()
+        self.CORE_VERSION_H = self.read_core_version_high()
+        self.CORE_VERSION_L = self.read_core_version_low()
+        self.FIRMWARE_VERSION_H = self.read_firmware_version_high()
+        self.FIRMWARE_VERSION_L = self.read_firmware_version_low()
+        self.DEVICE_NAME = self.read_device_name()
+        self.SERIAL_NUMBER = self.read_serial_number()
+        self.CLOCK_CONFIG = self.read_clock_configuration()
+        self.TIMESTAMP_OFFSET = self.read_timestamp_offset()
+
+    def info(self) -> None:
+        """
+        Prints the device information.
+        """
+        print("Device info:")
+        print(f"* Who am I: ({self.WHO_AM_I})")
+        print(f"* HW version: {self.HW_VERSION_H}.{self.HW_VERSION_L}")
+        print(f"* Assembly version: {self.ASSEMBLY_VERSION}")
+        print(f"* HARP version: {self.CORE_VERSION_H}.{self.CORE_VERSION_L}")
+        print(
+            f"* Firmware version: {self.FIRMWARE_VERSION_H}.{self.FIRMWARE_VERSION_L}"
+        )
+        print(f"* Device name: {self.DEVICE_NAME}")
+        print(f"* Serial number: {self.SERIAL_NUMBER}")
+        # print(f"* Mode: {self._read_device_mode().name}")
+
+    def connect(self) -> None:
+        """
+        Connects to the Harp device.
+        """
+        self._ser = HarpSerial(
+            self._serial_port,
+            baudrate=1000000,
+            timeout=self._timeout,
+            parity=serial.PARITY_NONE,
+            stopbits=1,
+            bytesize=8,
+            rtscts=True,
+        )
+
+        # open file if it is defined
+        if self._dump_file_path is not None:
+            self._dump_file = open(self._dump_file_path, "ab")
+
+    def disconnect(self) -> None:
+        """
+        Disconnects from the Harp device.
+        """
+        # close file if it exists
+        if self._dump_file:
+            self._dump_file.close()
+            self._dump_file = None
+
+        self._ser.close()
+
+    def dump_registers(self) -> list:
+        """
+        Asserts the DUMP bit to dump the values of all core and app registers
+        as Harp Read Reply Messages. More information on the DUMP bit can be found [here](https://harp-tech.org/protocol/Device.html#r_operation_ctrl-u16--operation-mode-configuration).
+
+        Returns
+        -------
+        list
+            The list containing the reply Harp messages for all the device's registers
+        """
+        address = CommonRegisters.OPERATION_CTRL
+        reg_value = self.send(HarpMessage(MessageType.READ, address, PayloadType.U8))
+
+        if reg_value is None:
+            return []
+
+        reg_value = reg_value.payload
+
+        # Assert DUMP bit
+        reg_value |= OperationCtrl.DUMP
+        self.send(HarpMessage(MessageType.WRITE, address, PayloadType.U8, reg_value))
+
+        # Receive the contents of all registers as Harp Read Reply Messages
+        replies = []
+        while True:
+            msg = self._read()
+            if msg is None:
+                break
+            else:
+                replies.append(msg)
+                self._dump_reply(msg.frame)
+        return replies
+
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+#>
+    def read_<#= ToSnakeCase(regName) #>(self) -> <#= regName #>:
+        """
+        Reads the <#= regName #> register.
+
+        Returns
+        -------
+        <#= pyType(interfaceType) #>
+            The value stored in the <#= regName #> register
+        """
+        message = <#= regName #>()
+        reply = self.send(message)
+        if reply is None:
+            raise HarpTimeoutException(self._timeout, message)
+
+        return <#= regName #>(reply.payload, reply.payload_type, timestamp=reply.timestamp, port=reply.port)
+
+<#      if ((reg.Access & RegisterAccess.Write) != 0) { #>
+    def write_<#= ToSnakeCase(regName) #>(self, value: <#= pyType(interfaceType) #>) -> <#= regName #>:
+        """
+        Writes a value to the <#= regName #> register.
+
+        Parameters
+        ----------
+        value : <#= pyType(interfaceType) #>
+            The value to be written to the <#= regName #> register
+        """
+        message = <#= regName #>(
+            message_type=MessageType.WRITE,
+            payload=value,
+        )
+        reply = self.send(message)
+        if reply is not None:
+            return <#= regName #>(reply.payload, reply.message_type, reply.payload_type, timestamp=reply.timestamp, port=reply.port)
+        return None
+
+<#
+        }
+    }
+#>
+
+    def send(
+        self,
+        message: HarpMessage,
+        *,
+        expect_reply: bool = True,
+        timeout_strategy: TimeoutStrategy | None = None,
+    ) -> HarpMessage | None:
+        """
+        Sends a Harp message and (optionally) waits for a reply.
+
+        Parameters
+        ----------
+        message : HarpMessage
+            The HarpMessage to be sent to the device
+        expect_reply : bool, optional
+            If False, do not wait for a reply (fire-and-forget)
+        timeout_strategy : TimeoutStrategy | None
+            Override the device-level timeout strategy for this call
+
+        Returns
+        -------
+        HarpMessage | None
+            Reply (or None when allowed by the timeout strategy or expect_reply=False)
+
+        Raises
+        -------
+        HarpTimeoutException
+            If no reply is received and the effective strategy requires raising
+        """
+        if (
+            type(message) is not HarpMessage
+            and any(isinstance(message, t) for t in self.COMMON_REGISTERS_TYPE.values())
+            and any(isinstance(message, t) for t in self.DEVICE_REGISTERS_TYPE.values())
+        ):
+            raise TypeError("message must be a HarpMessage instance")
+
+        self._ser.write(message.frame)
+
+        if not expect_reply:
+            return None
+
+        strategy = timeout_strategy or self._timeout_strategy
+
+        reply = self._read()
+        if reply is None:
+            hte = HarpTimeoutException(self._timeout, message)
+            if strategy in (
+                TimeoutStrategy.LOG_AND_RAISE,
+                TimeoutStrategy.LOG_AND_NONE,
+            ):
+                self.log.warning(str(hte))
+            if strategy in (TimeoutStrategy.RAISE, TimeoutStrategy.LOG_AND_RAISE):
+                raise hte
+        else:
+            self._dump_reply(reply.frame)
+        return reply
+
+    def _read(self) -> HarpMessage | None:
+        """
+        Reads an incoming serial message in a blocking way.
+
+        Returns
+        -------
+        HarpMessage | None
+            The incoming Harp message in case it exists
+
+        Raises
+        -------
+        TimeoutError
+            If no reply is received within the timeout period
+        """
+        try:
+            return self._ser.msg_q.get(block=True, timeout=self._timeout)
+        except queue.Empty:
+            return None
+
+    def _dump_reply(self, reply: bytearray):
+        """
+        Dumps the reply to a Harp message in the dump file in case it exists.
+        """
+        if self._dump_file:
+            self._dump_file.write(reply)
+
+    def get_events(self) -> list[HarpMessage]:
+        """
+        Gets all events from the event queue.
+
+        Returns
+        -------
+        list
+            The list containing every Harp event message that were on the queue
+        """
+        msgs = []
+        while True:
+            try:
+                msg = self._ser.event_q.get(timeout=False)
+                self._dump_reply(msg.frame)
+                msgs.append(msg)
+            except queue.Empty:
+                break
+        return msgs
+
+    def event_count(self) -> int:
+        """
+        Gets the number of events in the event queue.
+
+        Returns
+        -------
+        int
+            The number of events in the event queue
+        """
+        return self._ser.event_q.qsize()
+
+
+    def __enter__(self):
+        """
+        Support for using Device with 'with' statement.
+
+        Returns
+        -------
+        Device
+            The Device instance
+        """
+        # Connection is already established in __init__
+        # but we could add additional setup if needed
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Cleanup resources when exiting the 'with' block.
+
+        Parameters
+        ----------
+        exc_type : Exception type or None
+            Type of the exception that caused the context to be exited
+        exc_val : Exception or None
+            Exception instance that caused the context to be exited
+        exc_tb : traceback or None
+            Traceback if an exception occurred
+        """
+        self.disconnect()
+        # Return False to propagate exceptions that occurred in the with block
+        return False

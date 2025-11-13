@@ -8,6 +8,7 @@
   </PropertyGroup>
   <PropertyGroup>
     <DeviceMetadata>..\device.yml</DeviceMetadata>
+    <CoreMetadata>..\core.yml</CoreMetadata>
     <IOMetadata>..\ios.yml</IOMetadata>
   </PropertyGroup>
   <PropertyGroup>
@@ -22,6 +23,7 @@
     <PropertyGroup>
       <InterfaceFlags>-p:MetadataPath=$(DeviceMetadata) -p:Namespace=$(RootNamespace) -P=$(TargetDir)</InterfaceFlags>
       <PythonInterfaceFlags>-p:MetadataPath=$(DeviceMetadata) -p:Namespace=$(RootNamespace) -P=$(TargetDir)</PythonInterfaceFlags>
+      <PythonCoreFlags>-p:MetadataPath=$(CoreMetadata) -p:Namespace=$(RootNamespace) -P=$(TargetDir)</PythonCoreFlags>
       <FirmwareFlags>-p:RegisterMetadataPath=$(DeviceMetadata) -p:IOMetadataPath=$(IOMetadata) -P=$(TargetDir)</FirmwareFlags>
     </PropertyGroup>
     <ItemGroup>
@@ -32,15 +34,17 @@
           Condition="Exists($(DeviceMetadata)) And $([System.String]::new('%(TextTemplates.Identity)').EndsWith('Device.tt'))"
           Command="t4 %(TextTemplates.Identity) $(InterfaceFlags) -o=$(InterfacePath)/%(TextTemplates.Filename).cs" />
 
+    <!-- Generated specific python device -->
     <Exec WorkingDirectory="$(ProjectDir)"
           ConsoleToMSBuild="true"
           Condition="Exists($(DeviceMetadata)) And $([System.String]::new('%(TextTemplates.Identity)').EndsWith('harpdevice.tt'))"
           Command="t4 %(TextTemplates.Identity) $(PythonInterfaceFlags) -o=$(PythonInterfacePath)/harp/devices/$pythonmodulenameshort$/%(TextTemplates.Filename) -v" />
     
+    <!-- base classes for the core device to be placed in pyharp -->
     <Exec WorkingDirectory="$(ProjectDir)"
           ConsoleToMSBuild="true"
-          Condition="Exists($(DeviceMetadata)) And $([System.String]::new('%(TextTemplates.Identity)').EndsWith('base.tt'))"
-          Command="t4 %(TextTemplates.Identity) $(PythonInterfaceFlags) -o=$(PythonInterfacePath)/harp/devices/$pythonmodulenameshort$/%(TextTemplates.Filename) -v" />
+          Condition="Exists($(CoreMetadata)) And $([System.String]::new('%(TextTemplates.Identity)').EndsWith('coredevice.tt'))"
+          Command="t4 %(TextTemplates.Identity) $(PythonCoreFlags) -o=$(PythonInterfacePath)/%(TextTemplates.Filename) -v" />
 
     <Exec WorkingDirectory="$(ProjectDir)"
           ConsoleToMSBuild="true"
