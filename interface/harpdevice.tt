@@ -20,6 +20,7 @@ var groupmaskTypes = new HashSet<string>(deviceMetadata.GroupMasks.Keys);
 #>
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
+from typing import Literal, Optional
 
 from harp.protocol import MessageType, PayloadType
 from harp.protocol.exceptions import HarpException, HarpReadException, HarpWriteException
@@ -126,6 +127,38 @@ Func<string, string> pyType = t =>
             return "bool";
         default:
             return t; // fallback
+    }
+};
+
+// Helper for type conversion
+Func<string, string> pyTypeHM = t =>
+{
+    switch (t)
+    {
+        case "byte":
+        case "sbyte":
+        case "ushort":
+        case "short":
+        case "uint":
+        case "int":
+        case "ulong":
+        case "long":
+            return "int";
+        case "float":
+            return "float";
+        case "ArraySegment<byte>":
+        case "byte[]":
+            return "bytes";
+        case "short[]":
+        case "ushort[]":
+        case "uint[]":
+        case "int[]":
+        case "long[]":
+            return "list[int]";
+        case "EnableFlag":
+            return "bool";
+        default:
+            return "int"; // fallback
     }
 };
 #>
@@ -263,20 +296,105 @@ class <#= deviceName #>Registers(IntEnum):
     }
 #>
 
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+        var hasPayloadSpec = reg.PayloadSpec != null;
+        var isBitmask = bitmaskTypes.Contains(interfaceType);
+        var isGroupmask = groupmaskTypes.Contains(interfaceType);
+#>
+
+class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
+    ADDRESS: int = <#= address #>
+
+    def __init__(
+        self,
+        payload: Optional[<#= pyType(interfaceType) #>] = None,
+        message_type: MessageType = MessageType.READ,
+        payload_type: Literal[
+            PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>, PayloadType.TIMESTAMPED_<#= reg.Type.ToString().ToUpperInvariant() #>
+        ] = PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>,
+        *,
+        timestamp: Optional[float] = None,
+        port: int = 255,
+    ):
+        super().__init__(
+            message_type, self.ADDRESS, payload_type, payload, timestamp, port
+        )
+
+    @property
+    def payload(self) -> <#= pyType(interfaceType) #>
+<#  
+        if (hasPayloadSpec)
+        {
+#>
+        payload = super().payload
+        return <#= interfaceType #>(
+<#  
+        var memberCount = reg.PayloadSpec.Count;
+        var memberIndex = 0;
+            foreach (var member in reg.PayloadSpec) {
+                var offset = member.Value.Offset ?? memberIndex;
+#>
+            <#= member.Key #>=payload[<#= offset #>]<#= ++memberIndex < memberCount ? "," : "" #>
+<#
+            }
+#>
+        )
+<#  
+        }
+        else if (isBitmask || isGroupmask)
+        {
+#>
+        return <#= pyType(interfaceType) #>(super().payload)
+<#  
+        }
+        else
+        {
+#>
+        return <#= regName #>(reply.payload, reply.payload_type, timestamp=reply.timestamp, port=reply.port)
+<# 
+        }
+#>
+
+<#
+    }
+#>
+
+
+<#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS = {
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+#>
+    <#= address #>: <#= regName #>,
+<#
+    }
+#>
+}
+
 
 class <#= deviceName #>(Device):
     """
     <#= deviceName #> class for controlling the device.
     """
+    DEVICE_REGISTERS_TYPE = <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         # connect and load already happened in the base class
         # verify that WHO_AM_I matches the expected value
-        if self.WHO_AM_I != <#= deviceMetadata.WhoAmI #>:
+        if self.WHO_AM_I.payload != <#= deviceMetadata.WhoAmI #>:
             self.disconnect()
-            raise HarpException(f"WHO_AM_I mismatch: expected {<#= deviceMetadata.WhoAmI #>}, got {self.WHO_AM_I}")
+            raise HarpException(f"WHO_AM_I mismatch: expected {<#= deviceMetadata.WhoAmI #>}, got {self.WHO_AM_I.payload}")
 
 <# foreach (var registerMetadata in publicRegisters) {
     var regName = registerMetadata.Key;
@@ -296,7 +414,7 @@ class <#= deviceName #>(Device):
             Value read from the <#= regName #> register.
         """
         address = <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>
-        reply = self.send(HarpMessage(MessageType.READ, PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>, address))
+        reply = self.send(<#= regName #>())
         if reply is not None and reply.is_error:
             raise HarpReadException("<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>", reply)
 
@@ -322,13 +440,12 @@ class <#= deviceName #>(Device):
     else if (isBitmask || isGroupmask)
     {
 #>
-            return <#= interfaceType #>(reply.payload)
+            return <#= regName #>(reply.payload)
 <#  }
     else
     {
 #>
-            # Directly return the payload as it is a primitive type
-            return reply.payload
+            return <#= regName #>(reply.payload, reply.payload_type, timestamp=reply.timestamp, port=reply.port)
 <# 
     }
 #>
@@ -345,11 +462,11 @@ class <#= deviceName #>(Device):
             Value to write to the <#= regName #> register.
         """
         address = <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>
-        reply = self.send(HarpMessage(MessageType.WRITE, PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>, address, value))
+        reply = self.send(<#= regName #>(message_type=MessageType.WRITE, payload=value))
         if reply is not None and reply.is_error:
             raise HarpWriteException("<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>", reply)
 
-        return reply
+        return <#= regName #>(reply.payload, reply.payload_type, message_type=MessageType.WRITE, timestamp=reply.timestamp, port=reply.port)
 
 <# } #>
 <# } #>
