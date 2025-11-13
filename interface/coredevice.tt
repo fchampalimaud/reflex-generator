@@ -333,6 +333,36 @@ class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
 #>
 
 
+class <#= deviceName #>Registers(IntEnum):
+    """Enum for all available registers in the <#= deviceName #> device.
+
+    Attributes
+    ----------
+<# 
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+#>
+    <#= ToSnakeCase(regName, allCaps:true) #> : int
+        <#= reg.Description ?? "Register address for the " + regName + " register." #>
+<# } #>
+    """
+
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+#>
+    <#= ToSnakeCase(regName, allCaps:true) #> = <#= address #>
+<#
+    }
+#>
+
+
 <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS = {
 <#
     foreach (var registerMetadata in publicRegisters)
@@ -341,7 +371,7 @@ class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
         var reg = registerMetadata.Value;
         var address = reg.Address;
 #>
-    <#= address #>: <#= regName #>,
+    <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>: <#= regName #>,
 <#
     }
 #>
