@@ -327,7 +327,7 @@ class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
         )
 
     @property
-    def payload(self) -> <#= pyType(interfaceType) #>
+    def payload(self) -> <#= pyType(interfaceType) #>:
 <#  
         if (hasPayloadSpec)
         {
@@ -374,7 +374,7 @@ class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
         var reg = registerMetadata.Value;
         var address = reg.Address;
 #>
-    <#= address #>: <#= regName #>,
+    <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>: <#= regName #>,
 <#
     }
 #>
