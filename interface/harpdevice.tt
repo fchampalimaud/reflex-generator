@@ -29,19 +29,22 @@ from harp.serial import Device
 
 T = TypeVar("T")
 
+
 @dataclass(frozen=True)
 class Spec(Generic[T]):
     addr: int
     payload_type: PayloadType
-    decode: Callable[[Any], T]           # from payload (int|float|list) -> T
-    encode: Callable[[T], Any]           # from T -> payload (int|float|list)
+    decode: Callable[[Any], T]  # from payload (int|float|list) -> T
+    encode: Callable[[T], Any]  # from T -> payload (int|float|list)
+
 
 # Basic adapters
-def _id(x): return x
+def _id(x):
+    return x
+
+
 def _enum(enum_cls):
     return lambda v: enum_cls(v), lambda v: int(v)
-
-
 <#
 // Order is important for acronyms, so longer acronyms should be listed first
 string[] AcronymExceptions = new[] { "DIO", "DI", "DO", "IR", "USB" };
@@ -370,9 +373,7 @@ class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
         timestamp: Optional[float] = None,
         port: int = 255,
     ):
-        super().__init__(
-            message_type, self.ADDRESS, payload_type, payload, timestamp, port
-        )
+        super().__init__(message_type, self.ADDRESS, payload_type, payload, timestamp, port)
 
     @property
     def payload(self) -> <#= pyType(interfaceType) #>:
@@ -546,7 +547,6 @@ class <#= deviceName #>(Device):
         <#= pyType(interfaceType) #> | None
             Value read from the <#= regName #> register.
         """
-        address = <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>
         reply = self.send(<#= regName #>())
         if reply is not None and reply.is_error:
             raise HarpReadException("<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>", reply)
@@ -605,7 +605,6 @@ class <#= deviceName #>(Device):
         value : <#= pyType(interfaceType) #>
             Value to write to the <#= regName #> register.
         """
-        address = <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>
         reply = self.send(<#= regName #>(message_type=MessageType.WRITE, payload=value))
         if reply is not None and reply.is_error:
             raise HarpWriteException("<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>", reply)
