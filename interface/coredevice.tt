@@ -26,18 +26,40 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum, IntFlag
 from io import BufferedWriter
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Callable, ClassVar, Generic, Literal, Optional, TypeVar
 
 import serial
 from harp.protocol import (
-    CommonRegisters,
     MessageType,
     OperationCtrl,
     PayloadType,
 )
-from harp.protocol.exceptions import HarpTimeoutException
+from harp.protocol.exceptions import (
+    HarpReadException,
+    HarpTimeoutException,
+    HarpWriteException,
+)
 from harp.protocol.messages import HarpMessage
 from harp.serial.harp_serial import HarpSerial
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class Spec(Generic[T]):
+    addr: int
+    payload_type: PayloadType
+    decode: Callable[[Any], T]  # from payload (int|float|list) -> T
+    encode: Callable[[T], Any]  # from T -> payload (int|float|list)
+
+
+# Basic adapters
+def _id(x):
+    return x
+
+
+def _enum(enum_cls):
+    return lambda v: enum_cls(v), lambda v: int(v)
 
 
 class TimeoutStrategy(Enum):
@@ -60,7 +82,6 @@ class TimeoutStrategy(Enum):
     RETURN_NONE = "return_none"  # Return None
     LOG_AND_RAISE = "log_and_raise"
     LOG_AND_NONE = "log_and_none"
-
 <#
 // Order is important for acronyms, so longer acronyms should be listed first
 string[] AcronymExceptions = new[] { "DIO", "DI", "DO", "IR", "USB" };
@@ -196,6 +217,38 @@ Func<string, string> pyTypeHM = t =>
             return "int"; // fallback
     }
 };
+
+// Decode adapter to primitive Python types for Spec.decode
+Func<string, string> pyDecodeFunc = t =>
+{
+    switch (t)
+    {
+        case "byte":
+        case "sbyte":
+        case "ushort":
+        case "short":
+        case "uint":
+        case "int":
+        case "ulong":
+        case "long":
+            return "int";
+        case "float":
+            return "float";
+        case "ArraySegment<byte>":
+        case "byte[]":
+            return "_id";      // already bytes-like
+        case "short[]":
+        case "ushort[]":
+        case "uint[]":
+        case "int[]":
+        case "long[]":
+            return "list";     // list of ints
+        case "EnableFlag":
+            return "bool";
+        default:
+            return "_id";      // identity by default
+    }
+};
 #>
 <# // Payload dataclasses
 var payloadTypes = new HashSet<string>();
@@ -217,7 +270,7 @@ class <#= interfaceType #>:
         if (!string.IsNullOrEmpty(member.Value.Description))
         {
 #>
-        # <#= member.Value.Description #>
+    # <#= member.Value.Description #>
 <#      }
 #>
     <#= member.Key #>: <#= pyType(memberType) #>
@@ -300,7 +353,6 @@ class <#= groupMask.Key #>(IntEnum):
     }
 }
 #>
-
 <#
     foreach (var registerMetadata in publicRegisters)
     {
@@ -378,49 +430,201 @@ class <#= deviceName #>Registers(IntEnum):
 }
 
 
+<#= ToSnakeCase(deviceName, allCaps:true) #>_SPECS = {
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+        var hasPayloadSpec = reg.PayloadSpec != null;
+        var isBitmask = bitmaskTypes.Contains(interfaceType);
+        var isGroupmask = groupmaskTypes.Contains(interfaceType);
+#>
+    <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>: Spec(
+        addr=<#= address #>,
+        payload_type=PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>,
+<#  
+        if (hasPayloadSpec)
+        {
+            bool anyMasked = reg.PayloadSpec.Values.Any(m => m.Mask != null);
+            if (anyMasked)
+            {
+                // Bitfield in a single integer
+#>
+        decode=lambda payload: <#= interfaceType #>(
+<#
+                bool first = true;
+                foreach (var member in reg.PayloadSpec)
+                {
+                    var m = member.Value;
+                    if (m.Mask == null)
+                        continue; // we only know how to decode masked bitfields here
+
+                    var mask = m.Mask.Value;
+                    var isSingleBit = (mask & (mask - 1)) == 0; // power of two?
+                    var memberInterfaceType = TemplateHelper.GetInterfaceType(member.Value, reg.Type);
+                    var memberPyType = pyType(memberInterfaceType);
+                    var isCustomType = memberPyType == memberInterfaceType; // non-primitive -> likely enum/dataclass
+#>
+            <#= member.Key #>=<#= isSingleBit
+                ? (isCustomType
+                    ? memberInterfaceType + "((payload & 0x" + mask.ToString("X") + ") != 0)"
+                    : "(payload & 0x" + mask.ToString("X") + ") != 0")
+                : (isCustomType
+                    ? memberInterfaceType + "(payload & 0x" + mask.ToString("X") + ")"
+                    : "(payload & 0x" + mask.ToString("X") + ")")
+            #>,
+<#
+                    first = false;
+                }
+#>
+        ),
+<#
+            }
+            else
+            {
+                // Non‑bitfield payload: list/array of values
+#>
+        decode=lambda payload: <#= interfaceType #>(
+<#
+                var memberIndex = 0;
+                foreach (var member in reg.PayloadSpec)
+                {
+                    var offset = member.Value.Offset ?? memberIndex;
+                    ++memberIndex;
+#>
+            <#= member.Key #>=payload[<#= offset #>],
+<#
+                }
+#>
+        ),
+<#
+            }
+        }
+        else if (isBitmask || isGroupmask)
+        {
+#>
+        decode=lambda payload: <#= interfaceType #>(payload),
+<#
+        }
+        else
+        {
+#>
+        decode=<#= pyDecodeFunc(interfaceType) #>,
+<#
+        }
+#>
+<#  
+        if (hasPayloadSpec)
+        {
+            bool anyMasked = reg.PayloadSpec.Values.Any(m => m.Mask != null);
+            if (anyMasked)
+            {
+                bool first = true;
+                foreach (var member in reg.PayloadSpec)
+                {
+                    var m = member.Value;
+                    if (m.Mask == null)
+                        continue;
+
+                    var mask = m.Mask.Value;
+                    var isSingleBit = (mask & (mask - 1)) == 0; // power of two
+
+                    // For single‑bit masks, treat any non‑zero as True (works for bool and IntEnum 0/1)
+                    var expr = isSingleBit
+                        ? $"(0x{mask:X} if bool(value.{member.Key}) else 0)"
+                        : $"(int(value.{member.Key}) & 0x{mask:X})";
+#>
+        <#= (first ? "encode=lambda value: " : "| ") #><#= expr #>
+<#
+                    first = false;
+                }
+#>
+        ,
+<#
+            }
+            else
+            {
+                // Non‑bitfield struct payload: list of fields
+#>
+        encode=lambda value: [
+<#
+                foreach (var member in reg.PayloadSpec)
+                {
+#>
+            value.<#= member.Key #>,
+<#
+                }
+#>
+        ],
+<#
+            }
+        }
+        else if (isBitmask || isGroupmask)
+        {
+#>
+        encode=lambda value: int(value),
+<#
+        }
+        else
+        {
+#>
+        encode=_id,
+<#
+        }
+#>
+    ),
+<#
+    }
+#>
+}
+
+
 class Device:
     """
     The `Device` class provides the interface for interacting with Harp devices. This implementation of the Harp device was based on the official documentation available on the [harp-tech website](https://harp-tech.org/protocol/Device.html).
 
     Attributes
     ----------
-    WHO_AM_I : int
-        The device ID number. A list of devices can be found [here](https://github.com/harp-tech/protocol/blob/main/whoami.md)
-    HW_VERSION_H : int
-        The major hardware version
-    HW_VERSION_L : int
-        The minor hardware version
-    ASSEMBLY_VERSION : int
-        The version of the assembled components
-    HARP_VERSION_H : int
-        The major Harp core version
-    HARP_VERSION_L : int
-        The minor Harp core version
-    FIRMWARE_VERSION_H : int
-        The major firmware version
-    FIRMWARE_VERSION_L : int
-        The minor firmware version
-    DEVICE_NAME : str
-        The device name stored in the Harp device
-    SERIAL_NUMBER : int, optional
-        The serial number of the device
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+        if(!reg.Volatile)
+        {
+#>
+    <#= ToSnakeCase(regName, allCaps:true) #> : <#= pyType(interfaceType) #>
+        <#= reg.Description ?? "The value stored in the " + regName + " register." #>
+<#
+        }
+    }
+#>
     """
 
-    WHO_AM_I: int
-    HW_VERSION_H: int
-    HW_VERSION_L: int
-    ASSEMBLY_VERSION: int
-    CORE_VERSION_H: int
-    CORE_VERSION_L: int
-    FIRMWARE_VERSION_H: int
-    FIRMWARE_VERSION_L: int
-    DEVICE_NAME: str
-    SERIAL_NUMBER: int
-    CLOCK_CONFIG: int
-    TIMESTAMP_OFFSET: int
+    COMMON_SPECS: ClassVar[dict[Any, Spec]] = <#= ToSnakeCase(deviceName, allCaps:true) #>_SPECS
+    DEVICE_SPECS: ClassVar[dict[Any, Spec]] = {}
 
-    COMMON_REGISTERS_TYPE = <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS
-    DEVICE_REGISTERS_TYPE = {}
+    COMMON_REGISTERS_TYPE: ClassVar[dict[Any, type[HarpMessage]]] = <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS
+    DEVICE_REGISTERS_TYPE: ClassVar[dict[Any, type[HarpMessage]]] = {}
+
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+        if(!reg.Volatile)
+        {
+#>
+    <#= ToSnakeCase(regName, allCaps:true) #>: <#= pyType(interfaceType) #>
+<#
+        }
+    }
+    #>
 
     _ser: HarpSerial
     _dump_file_path: Optional[Path]
@@ -521,6 +725,32 @@ class Device:
 
         self._ser.close()
 
+    def _join_specs(self) -> dict[int, Spec]:
+        return self.COMMON_SPECS | self.DEVICE_SPECS
+
+    def _send_checked(self, msg: HarpMessage) -> Optional[HarpMessage]:
+        reply = self.send(msg)
+        if reply is not None and reply.is_error:
+            # Route read vs write exception appropriately
+            if msg.message_type == MessageType.READ:
+                raise HarpReadException(f"{msg.address}", reply)
+            else:
+                raise HarpWriteException(f"{msg.address}", reply)
+        return reply
+
+    def read_reg(self, reg: <#= deviceName #>Registers):
+        spec = self._join_specs()[reg]
+        reply = self._send_checked(HarpMessage(MessageType.READ, spec.addr, spec.payload_type))
+        if reply is None:
+            return None
+        return spec.decode(reply.payload)
+
+    def write_reg(self, reg: <#= deviceName #>Registers, value):
+        spec = self._join_specs()[reg]
+        payload = spec.encode(value)
+        reply = self._send_checked(HarpMessage(MessageType.WRITE, spec.addr, spec.payload_type, payload=payload))
+        return spec.decode(reply.payload) if reply is not None else None
+
     def dump_registers(self) -> list:
         """
         Asserts the DUMP bit to dump the values of all core and app registers
@@ -531,7 +761,7 @@ class Device:
         list
             The list containing the reply Harp messages for all the device's registers
         """
-        address = CommonRegisters.OPERATION_CTRL
+        address = CommonRegisters.OPERATION_CONTROL
         reg_value = self.send(HarpMessage(MessageType.READ, address, PayloadType.U8))
 
         if reg_value is None:
@@ -576,7 +806,23 @@ class Device:
         if reply is None:
             raise HarpTimeoutException(self._timeout, message)
 
-        return <#= regName #>(reply.payload, reply.payload_type, timestamp=reply.timestamp, port=reply.port)
+        return <#= regName #>(
+            reply.payload,
+            payload_type=reply.payload_type,
+            timestamp=reply.timestamp,
+            port=reply.port,
+        )
+
+    def read2_<#= ToSnakeCase(regName) #>(self) -> <#= pyType(interfaceType) #>:
+        """
+        Reads the <#= regName #> register.
+
+        Returns
+        -------
+        <#= pyType(interfaceType) #>
+            The value stored in the <#= regName #> register
+        """
+        return self.read_reg(<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>)
 
 <#      if ((reg.Access & RegisterAccess.Write) != 0) { #>
     def write_<#= ToSnakeCase(regName) #>(self, value: <#= pyType(interfaceType) #>) -> <#= regName #>:
@@ -594,8 +840,25 @@ class Device:
         )
         reply = self.send(message)
         if reply is not None:
-            return <#= regName #>(reply.payload, reply.message_type, reply.payload_type, timestamp=reply.timestamp, port=reply.port)
+            return <#= regName #>(
+                reply.payload,
+                reply.message_type,
+                reply.payload_type,
+                timestamp=reply.timestamp,
+                port=reply.port,
+            )
         return None
+
+    def write2_<#= ToSnakeCase(regName) #>(self, value: <#= pyType(interfaceType) #>) -> <#= pyType(interfaceType) #>:
+        """
+        Writes a value to the <#= regName #> register.
+
+        Parameters
+        ----------
+        value : <#= pyType(interfaceType) #>
+            The value to be written to the <#= regName #> register
+        """
+        return self.write_reg(<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>, value)
 
 <#
         }
@@ -714,7 +977,6 @@ class Device:
             The number of events in the event queue
         """
         return self._ser.event_q.qsize()
-
 
     def __enter__(self):
         """
