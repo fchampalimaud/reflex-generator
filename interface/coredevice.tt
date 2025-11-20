@@ -154,6 +154,27 @@ string ToSnakeCase(string name, bool allCaps = false)
     return allCaps ? result.ToUpperInvariant() : result;
 }
 
+string ToSpacedWords(string name)
+{
+    if (string.IsNullOrEmpty(name)) return name;
+
+    // Reuse ToSnakeCase to keep units/acronyms grouped, then space + title-case
+    var snake = ToSnakeCase(name, allCaps: false);
+    var parts = snake.Split('_');
+
+    var ti = CultureInfo.InvariantCulture.TextInfo;
+    for (int i = 0; i < parts.Length; i++)
+    {
+        var w = parts[i];
+        // Keep known acronyms in ALL CAPS
+        if (AcronymExceptions.Any(a => string.Equals(a, w, StringComparison.OrdinalIgnoreCase)))
+            parts[i] = w.ToUpperInvariant();
+        else
+            parts[i] = ti.ToTitleCase(w); // e.g., "pulse" -> "Pulse"
+    }
+    return string.Join(" ", parts);
+}
+
 // Helper for type conversion
 Func<string, string> pyType = t =>
 {
@@ -662,38 +683,43 @@ class Device:
         self.connect()
         self.load()
 
-<# //TODO: generate this automatically #>
     def load(self) -> None:
         """
         Loads the data stored in the device's common registers.
         """
-        self.WHO_AM_I = self.read_who_am_i()
-        self.HW_VERSION_H = self.read_hardware_version_high()
-        self.HW_VERSION_L = self.read_hardware_version_low()
-        self.ASSEMBLY_VERSION = self.read_assembly_version()
-        self.CORE_VERSION_H = self.read_core_version_high()
-        self.CORE_VERSION_L = self.read_core_version_low()
-        self.FIRMWARE_VERSION_H = self.read_firmware_version_high()
-        self.FIRMWARE_VERSION_L = self.read_firmware_version_low()
-        self.DEVICE_NAME = self.read_device_name()
-        self.SERIAL_NUMBER = self.read_serial_number()
-        self.CLOCK_CONFIG = self.read_clock_configuration()
-        self.TIMESTAMP_OFFSET = self.read_timestamp_offset()
+<#
+        // Initialize non-volatile register-backed attributes using their read_... methods
+        foreach (var registerMetadata in publicRegisters)
+        {
+            var regName = registerMetadata.Key;
+            var reg = registerMetadata.Value;
+            if (!reg.Volatile)
+            {
+#>
+        self.<#= ToSnakeCase(regName, allCaps:true) #> = self.read_<#= ToSnakeCase(regName) #>()
+<#
+            }
+        }
+#>
 
     def info(self) -> None:
         """
         Prints the device information.
         """
         print("Device info:")
-        print(f"* Who am I: ({self.WHO_AM_I})")
-        print(f"* HW version: {self.HW_VERSION_H}.{self.HW_VERSION_L}")
-        print(f"* Assembly version: {self.ASSEMBLY_VERSION}")
-        print(f"* HARP version: {self.CORE_VERSION_H}.{self.CORE_VERSION_L}")
-        print(
-            f"* Firmware version: {self.FIRMWARE_VERSION_H}.{self.FIRMWARE_VERSION_L}"
-        )
-        print(f"* Device name: {self.DEVICE_NAME}")
-        print(f"* Serial number: {self.SERIAL_NUMBER}")
+<#
+        foreach (var registerMetadata in publicRegisters)
+        {
+            var regName = registerMetadata.Key;
+            var reg = registerMetadata.Value;
+            if (!reg.Volatile)
+            {
+#>
+        print(f"<#= ToSpacedWords(regName) #>: {self.<#= ToSnakeCase(regName, allCaps:true) #>}")
+<#
+            }
+        }
+#>
         # print(f"* Mode: {self._read_device_mode().name}")
 
     def connect(self) -> None:
