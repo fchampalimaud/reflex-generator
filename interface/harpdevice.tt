@@ -20,12 +20,28 @@ var groupmaskTypes = new HashSet<string>(deviceMetadata.GroupMasks.Keys);
 #>
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
-from typing import Literal, Optional
+from typing import Any, Callable, Generic, Literal, Optional, TypeVar
 
 from harp.protocol import MessageType, PayloadType
 from harp.protocol.exceptions import HarpException, HarpReadException, HarpWriteException
 from harp.protocol.messages import HarpMessage
 from harp.serial import Device
+
+T = TypeVar("T")
+
+@dataclass(frozen=True)
+class Spec(Generic[T]):
+    addr: int
+    payload_type: PayloadType
+    decode: Callable[[Any], T]           # from payload (int|float|list) -> T
+    encode: Callable[[T], Any]           # from T -> payload (int|float|list)
+
+# Basic adapters
+def _id(x): return x
+def _enum(enum_cls):
+    return lambda v: enum_cls(v), lambda v: int(v)
+
+
 <#
 // Order is important for acronyms, so longer acronyms should be listed first
 string[] AcronymExceptions = new[] { "DIO", "DI", "DO", "IR", "USB" };
@@ -159,6 +175,38 @@ Func<string, string> pyTypeHM = t =>
             return "bool";
         default:
             return "int"; // fallback
+    }
+};
+
+// Decode adapter to primitive Python types for Spec.decode
+Func<string, string> pyDecodeFunc = t =>
+{
+    switch (t)
+    {
+        case "byte":
+        case "sbyte":
+        case "ushort":
+        case "short":
+        case "uint":
+        case "int":
+        case "ulong":
+        case "long":
+            return "int";
+        case "float":
+            return "float";
+        case "ArraySegment<byte>":
+        case "byte[]":
+            return "_id";      // already bytes-like
+        case "short[]":
+        case "ushort[]":
+        case "uint[]":
+        case "int[]":
+        case "long[]":
+            return "list";     // list of ints
+        case "EnableFlag":
+            return "bool";
+        default:
+            return "_id";      // identity by default
     }
 };
 #>
@@ -356,7 +404,7 @@ class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
         else
         {
 #>
-        return <#= regName #>(reply.payload, reply.payload_type, timestamp=reply.timestamp, port=reply.port)
+        return super().payload
 <# 
         }
 #>
@@ -381,11 +429,96 @@ class <#= regName #>(HarpMessage[<#= pyTypeHM(interfaceType) #>]):
 }
 
 
+<#= ToSnakeCase(deviceName, allCaps:true) #>_SPECS = {
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+        var address = reg.Address;
+        var interfaceType = TemplateHelper.GetInterfaceType(registerMetadata.Key, registerMetadata.Value);
+        var hasPayloadSpec = reg.PayloadSpec != null;
+        var isBitmask = bitmaskTypes.Contains(interfaceType);
+        var isGroupmask = groupmaskTypes.Contains(interfaceType);
+#>
+    <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>: Spec(
+        addr=<#= address #>,
+        payload_type=PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>,
+<#
+            if (hasPayloadSpec)
+            { 
+#>
+        decode=lambda payload: <#= interfaceType #>(
+<#  
+        var memberCount = reg.PayloadSpec.Count;
+        var memberIndex = 0;
+            foreach (var member in reg.PayloadSpec) {
+                var offset = member.Value.Offset ?? memberIndex;
+#>
+                <#= member.Key #>=payload[<#= offset #>]<#= ++memberIndex < memberCount ? "," : "" #>
+<#
+            }
+#>
+            ),
+<#
+            }
+            else if (isBitmask || isGroupmask)
+            { 
+#>
+        decode=lambda payload: <#= interfaceType #>(payload),
+<#
+            }
+            else
+            {
+#>
+        decode=<#= pyDecodeFunc(interfaceType) #>,
+<#
+            }
+#>
+<#
+            if (hasPayloadSpec)
+            { 
+#>
+        encode=lambda value: [
+<#  
+        var memberCount = reg.PayloadSpec.Count;
+        var memberIndex = 0;
+            foreach (var member in reg.PayloadSpec) {
+                var offset = member.Value.Offset ?? memberIndex;
+#>
+                    value.<#= member.Key #><#= ++memberIndex < memberCount ? "," : "" #>
+<#
+            }
+#>
+                ],
+<#
+            }
+            else if (isBitmask || isGroupmask)
+            {
+#>
+        encode=lambda value: int(value),
+<#
+            }
+            else
+            {
+#>
+        encode=_id,
+<#
+            }
+#>
+    ),
+<#
+    }
+#>
+}
+
+
 class <#= deviceName #>(Device):
     """
     <#= deviceName #> class for controlling the device.
     """
     DEVICE_REGISTERS_TYPE = <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS
+    DEVICE_SPECS = <#= ToSnakeCase(deviceName, allCaps:true) #>_SPECS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -451,6 +584,17 @@ class <#= deviceName #>(Device):
 #>
         return None
 
+    def read2_<#= ToSnakeCase(regName) #>(self) -> <#= pyType(interfaceType) #> | None:
+        """
+        Reads the contents of the <#= regName #> register.
+
+        Returns
+        -------
+        <#= pyType(interfaceType) #> | None
+            Value read from the <#= regName #> register.
+        """
+        return self.read_reg(<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>)
+
 <# if ((reg.Access & RegisterAccess.Write) != 0) { #>
     def write_<#= ToSnakeCase(regName) #>(self, value: <#= pyType(interfaceType) #>) -> HarpMessage | None:
         """
@@ -466,7 +610,24 @@ class <#= deviceName #>(Device):
         if reply is not None and reply.is_error:
             raise HarpWriteException("<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>", reply)
 
-        return <#= regName #>(reply.payload, reply.payload_type, message_type=MessageType.WRITE, timestamp=reply.timestamp, port=reply.port)
+        return <#= regName #>(
+            reply.payload,
+            MessageType.WRITE,
+            reply.payload_type,
+            timestamp=reply.timestamp,
+            port=reply.port,
+        )
+
+    def write2_<#= ToSnakeCase(regName) #>(self, value: <#= pyType(interfaceType) #>) -> HarpMessage | None:
+        """
+        Writes a value to the <#= regName #> register.
+
+        Parameters
+        ----------
+        value : <#= pyType(interfaceType) #>
+            Value to write to the <#= regName #> register.
+        """
+        return self.write_reg(<#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>, value)
 
 <# } #>
 <# } #>
