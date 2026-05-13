@@ -25,26 +25,10 @@ from typing import Any, Callable, Generic, Literal, Optional, TypeVar
 from harp.protocol import MessageType, PayloadType
 from harp.protocol.exceptions import HarpException, HarpReadException, HarpWriteException
 from harp.protocol.messages import HarpMessage
-from harp.serial import Device
+from harp.serial import Device, Spec, _enum, _id, _pack_struct_by_offset
 
 T = TypeVar("T")
 
-
-@dataclass(frozen=True)
-class Spec(Generic[T]):
-    addr: int
-    payload_type: PayloadType
-    decode: Callable[[Any], T]  # from payload (int|float|list) -> T
-    encode: Callable[[T], Any]  # from T -> payload (int|float|list)
-
-
-# Basic adapters
-def _id(x):
-    return x
-
-
-def _enum(enum_cls):
-    return lambda v: enum_cls(v), lambda v: int(v)
 <#
 // Order is important for acronyms, so longer acronyms should be listed first
 string[] AcronymExceptions = new[] { "DIO", "DI", "DO", "IR", "USB" };
