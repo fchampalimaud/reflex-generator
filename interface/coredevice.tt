@@ -24,9 +24,10 @@ import logging
 import queue
 from dataclasses import dataclass
 from enum import Enum, IntEnum, IntFlag
+from functools import cached_property
 from io import BufferedWriter
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Generic, Literal, Optional, TypeVar
+from typing import Any, Callable, ClassVar, Generic, Literal, Optional, TypeAlias, TypeVar, overload
 
 import serial
 from harp.protocol import (
@@ -43,6 +44,36 @@ from harp.protocol.messages import HarpMessage
 from harp.serial.harp_serial import HarpSerial
 
 T = TypeVar("T")
+R = TypeVar("R", bound=IntEnum)
+
+CoreDevice: TypeAlias = "Device[<#= deviceName #>Registers]"
+
+
+# matches _PayloadTypeFlags.HAS_TIMESTAMP in base.py. 
+# redefined here to avoid accessing "private" members of base.py
+_HAS_TIMESTAMP_FLAG = 0x10
+
+
+def _base_payload_type(pt: PayloadType) -> PayloadType:
+    """
+    Remove the HAS_TIMESTAMP flag so sizing/dtype reflect only the scalar storage type.
+    """
+    return PayloadType(int(pt) & ~_HAS_TIMESTAMP_FLAG)
+
+
+# struct scalar codes for the PayloadTypes defined in base.py 
+# (used for packing/unpacking scalar payloads in HarpMessage.frame)
+_STRUCT_CODE_BY_BASE_PT: dict[PayloadType, str] = {
+    PayloadType.U8: "B",
+    PayloadType.S8: "b",
+    PayloadType.U16: "H",
+    PayloadType.S16: "h",
+    PayloadType.U32: "I",
+    PayloadType.S32: "i",
+    PayloadType.U64: "Q",
+    PayloadType.S64: "q",
+    PayloadType.FLOAT: "f",
+}
 
 
 @dataclass(frozen=True)
@@ -51,6 +82,63 @@ class Spec(Generic[T]):
     payload_type: PayloadType
     decode: Callable[[Any], T]  # from payload (int|float|list) -> T
     encode: Callable[[T], Any]  # from T -> payload (int|float|list)
+    count: int = 1  # for array payloads, number of elements (default 1 for scalar)
+
+    def payload_itemsize(self) -> int:
+        """
+        Scalar element size in bytes (1/2/4/8), independent of timestamp presence.
+        """
+        base = _base_payload_type(self.payload_type)
+        return int(base.type_size())
+
+    def payload_nbytes(self) -> int:
+        """
+        Total payload byte size (excluding timestamp and checksum).
+        """
+        return self.count * self.payload_itemsize()
+
+    def payload_struct_format(self, *, endian: str = "<") -> str:
+        """
+        struct format string for payload-only (excluding timestamp/checksum).
+        Example: '<4h' for 4x S16.
+        """
+        base = _base_payload_type(self.payload_type)
+        code = _STRUCT_CODE_BY_BASE_PT[base]
+        return f"{endian}{self.count}{code}"
+
+    def numpy_dtype(self, *, endian: str = "<", fields: tuple[str, ...] | None = None):
+        """
+        Optional helper: builds a NumPy dtype if NumPy is installed, else returns None.
+
+        - count == 1 -> scalar dtype
+        - count > 1  -> fixed-size vector dtype (scalar, (count,))
+        - fields provided (len == count) -> structured dtype with named scalar fields
+        """
+        try:
+            import numpy as np  # type: ignore
+        except Exception:
+            return None
+
+        base = _base_payload_type(self.payload_type)
+
+        # base.py defines only FLOAT (4 bytes) for float payloads
+        if base.is_float():
+            if int(base.type_size()) != 4:
+                raise ValueError(f"Unsupported float size for PayloadType: {base!r}")
+            scalar = np.dtype(endian + "f4")
+        else:
+            size = int(base.type_size())  # 1/2/4/8
+            kind = "i" if base.is_signed() else "u"
+            scalar = np.dtype(endian + f"{kind}{size}")
+
+        if fields is not None:
+            if len(fields) != self.count:
+                raise ValueError(f"fields length ({len(fields)}) != count ({self.count})")
+            return np.dtype([(name, scalar) for name in fields])
+
+        if self.count == 1:
+            return scalar
+        return np.dtype((scalar, (self.count,)))
 
 
 # Basic adapters
@@ -61,6 +149,16 @@ def _id(x):
 def _enum(enum_cls):
     return lambda v: enum_cls(v), lambda v: int(v)
 
+
+def _pack_struct_by_offset(value: Any, count: int, fields_by_offset: dict[int, str]) -> list[Any]:
+    """
+    Pack a dataclass-like payload object into a positional list, honoring payloadSpec offsets.
+    Missing offsets (if any) are filled with 0.
+    """
+    payload: list[Any] = [0] * count
+    for off, name in fields_by_offset.items():
+        payload[off] = getattr(value, name)
+    return payload
 
 class TimeoutStrategy(Enum):
     """
@@ -462,21 +560,51 @@ class <#= deviceName #>Registers(IntEnum):
         var hasPayloadSpec = reg.PayloadSpec != null;
         var isBitmask = bitmaskTypes.Contains(interfaceType);
         var isGroupmask = groupmaskTypes.Contains(interfaceType);
+
+        var specCount = reg.Length > 0 ? reg.Length : 1;
+        var anyMasked = hasPayloadSpec && reg.PayloadSpec.Values.Any(m => m.Mask != null);
+
+        if (anyMasked)
+        {
+            specCount = 1; // bitfield packed into a scalar integer
+        }
+        else if (hasPayloadSpec)
+        {
+            int maxOffset = -1;
+            int memberIndex = 0;
+            foreach (var member in reg.PayloadSpec)
+            {
+                int offset = member.Value.Offset ?? memberIndex;
+                if (offset > maxOffset) maxOffset = offset;
+                memberIndex++;
+            }
+
+            if (maxOffset >= 0)
+            {
+                specCount = Math.Max(specCount, maxOffset + 1);
+            }
+        }
 #>
     <#= deviceName #>Registers.<#= ToSnakeCase(regName, allCaps:true) #>: Spec(
         addr=<#= address #>,
         payload_type=PayloadType.<#= reg.Type.ToString().ToUpperInvariant() #>,
+<#
+        if(specCount != 1)
+        {
+#>
+        count=<#= specCount #>,
+<#
+        }
+#>
 <#  
         if (hasPayloadSpec)
         {
-            bool anyMasked = reg.PayloadSpec.Values.Any(m => m.Mask != null);
             if (anyMasked)
             {
                 // Bitfield in a single integer
 #>
         decode=lambda payload: <#= interfaceType #>(
 <#
-                bool first = true;
                 foreach (var member in reg.PayloadSpec)
                 {
                     var m = member.Value;
@@ -498,7 +626,6 @@ class <#= deviceName #>Registers(IntEnum):
                     : "(payload & 0x" + mask.ToString("X") + ")")
             #>,
 <#
-                    first = false;
                 }
 #>
         ),
@@ -540,7 +667,6 @@ class <#= deviceName #>Registers(IntEnum):
 <#  
         if (hasPayloadSpec)
         {
-            bool anyMasked = reg.PayloadSpec.Values.Any(m => m.Mask != null);
             if (anyMasked)
             {
                 bool first = true;
@@ -570,16 +696,23 @@ class <#= deviceName #>Registers(IntEnum):
             {
                 // Non‑bitfield struct payload: list of fields
 #>
-        encode=lambda value: [
+        encode=lambda value: _pack_struct_by_offset(
+            value,
+            <#= specCount #>,
+            {
 <#
+                var memberIndex = 0;
                 foreach (var member in reg.PayloadSpec)
                 {
+                    var offset = member.Value.Offset ?? memberIndex;
+                    memberIndex++;
 #>
-            value.<#= member.Key #>,
+                <#= offset #>: "<#= member.Key #>",
 <#
                 }
 #>
-        ],
+            },
+        ),
 <#
             }
         }
@@ -603,7 +736,69 @@ class <#= deviceName #>Registers(IntEnum):
 }
 
 
-class Device:
+# Optional payload field-name metadata (offset-ordered), for NumPy structured dtypes.
+# Only emitted when payloadSpec is not mask-based and offsets are contiguous [0..count-1].
+<#= ToSnakeCase(deviceName, allCaps:true) #>_FIELDS: dict[<#= deviceName #>Registers, tuple[str, ...]] = {
+<#
+    foreach (var registerMetadata in publicRegisters)
+    {
+        var regName = registerMetadata.Key;
+        var reg = registerMetadata.Value;
+
+        if (reg.PayloadSpec == null || reg.PayloadSpec.Count == 0)
+            continue;
+
+        // Skip bitfield-style payloads (mask-based)
+        var anyMasked = reg.PayloadSpec.Values.Any(m => m.Mask != null);
+        if (anyMasked)
+            continue;
+
+        // Collect (name, offset) using offset ?? index
+        var members = new List<(string Name, int Offset)>();
+        int memberIndex = 0;
+        foreach (var member in reg.PayloadSpec)
+        {
+            int offset = member.Value.Offset ?? memberIndex;
+            members.Add((member.Key, offset));
+            memberIndex++;
+        }
+
+        int maxOffset = members.Max(m => m.Offset);
+        int count = Math.Max(reg.Length > 0 ? reg.Length : 1, maxOffset + 1);
+
+        var ordered = members.OrderBy(m => m.Offset).ToList();
+
+        // Require offsets == 0..count-1 and unique
+        bool contiguous = ordered.Count == count;
+        if (contiguous)
+        {
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                if (ordered[i].Offset != i) { contiguous = false; break; }
+            }
+        }
+
+        if (!contiguous)
+            continue;
+
+        var regConst = ToSnakeCase(regName, allCaps:true);
+#>
+    <#= deviceName #>Registers.<#= regConst #>: (
+<#
+        for (int i = 0; i < ordered.Count; i++)
+        {
+#>        "<#= ordered[i].Name #>"<#= (i < ordered.Count - 1 ? "," : "") #>
+<#
+        }
+#>
+    ),
+<#
+    }
+#>
+}
+
+
+class Device(Generic[R]):
     """
     The `Device` class provides the interface for interacting with Harp devices. This implementation of the Harp device was based on the official documentation available on the [harp-tech website](https://harp-tech.org/protocol/Device.html).
 
@@ -626,11 +821,11 @@ class Device:
 #>
     """
 
-    COMMON_SPECS: ClassVar[dict[Any, Spec]] = <#= ToSnakeCase(deviceName, allCaps:true) #>_SPECS
-    DEVICE_SPECS: ClassVar[dict[Any, Spec]] = {}
+    COMMON_SPECS: ClassVar[dict[<#= deviceName #>Registers, Spec[Any]]] = <#= ToSnakeCase(deviceName, allCaps:true) #>_SPECS
+    DEVICE_SPECS: ClassVar[dict[R, Spec[Any]]] = {}
 
-    COMMON_REGISTERS_TYPE: ClassVar[dict[Any, type[HarpMessage]]] = <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS
-    DEVICE_REGISTERS_TYPE: ClassVar[dict[Any, type[HarpMessage]]] = {}
+    COMMON_REGISTERS_TYPE: ClassVar[dict[<#= deviceName #>Registers, type[HarpMessage[Any]]]] = <#= ToSnakeCase(deviceName, allCaps:true) #>_REGISTERS
+    DEVICE_REGISTERS_TYPE: ClassVar[dict[R, type[HarpMessage[Any]]]] = {}
 
 <#
     foreach (var registerMetadata in publicRegisters)
@@ -751,7 +946,8 @@ class Device:
 
         self._ser.close()
 
-    def _join_specs(self) -> dict[int, Spec]:
+    @cached_property
+    def _join_specs(self) -> dict[IntEnum, Spec[Any]]:
         return self.COMMON_SPECS | self.DEVICE_SPECS
 
     def _send_checked(self, msg: HarpMessage) -> Optional[HarpMessage]:
@@ -764,14 +960,26 @@ class Device:
                 raise HarpWriteException(f"{msg.address}", reply)
         return reply
 
-    def read_reg(self, reg: <#= deviceName #>Registers):
+    @overload
+    def read_reg(self, reg: <#= deviceName #>Registers) -> Any: ...
+
+    @overload
+    def read_reg(self, reg: R) -> Any: ...
+
+    def read_reg(self, reg: <#= deviceName #>Registers | R):
         spec = self._join_specs()[reg]
         reply = self._send_checked(HarpMessage(MessageType.READ, spec.addr, spec.payload_type))
         if reply is None:
             return None
         return spec.decode(reply.payload)
 
-    def write_reg(self, reg: <#= deviceName #>Registers, value):
+    @overload
+    def write_reg(self, reg: <#= deviceName #>Registers, value: Any) -> Any: ...
+
+    @overload
+    def write_reg(self, reg: R, value: Any) -> Any: ...
+
+    def write_reg(self, reg: <#= deviceName #>Registers | R, value):
         spec = self._join_specs()[reg]
         payload = spec.encode(value)
         reply = self._send_checked(HarpMessage(MessageType.WRITE, spec.addr, spec.payload_type, payload=payload))
